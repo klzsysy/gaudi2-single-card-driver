@@ -1,23 +1,24 @@
 #!/bin/bash
 # ==============================================================================
-#  Intel Gaudi2 (HL-225) 一键部署脚本 —— Gaudi 1.24.1 + PyTorch 2.11
+#  Intel Gaudi2 (HL-225) 一键部署脚本 —— Gaudi 1.24.2 (Ubuntu 22.04/24.04)
 # ==============================================================================
 #
 #  适用:HL-225 / HL-225H / HL-225C(OAM 模组 + OAM→PCIe 转接卡)
 #        非 Intel 认证平台(如 Haswell-EP 等老平台)
 #
-#  本脚本封装的完整方案(5 项修复,全部经过实测验证):
+#  本脚本封装的完整方案(社区原始方案包含 5 项修复):
 #    ① 驱动补丁:server_type = HL_SERVER_GAUDI2_HLS2
 #    ② 驱动补丁:忽略 bad SerDes type 0xFFFF
 #    ③ 驱动补丁:固件 link_mask=0 时不清零 ports_mask(否则无 RDMA)
 #    ④ 内核参数 iommu=pt  ★ 核心:修复 1.24.1 的 host-resident 页表 bug
 #    ⑤ 模块参数 nic_ports_ext_mask=0
 #
-#  已验证:matmul 4096x4096 / relu / fwd+bwd 全部通过,重启后依然正常
+#  历史验证:Ubuntu 24.04 + Gaudi 1.24.1 的 matmul / relu / fwd+bwd
+#  当前版本以安装后的验证结果为准; --skip-pytorch 不做计算验证
 #
 #  用法:
 #    sudo ./install-gaudi2.sh                  # 完整安装
-#    sudo ./install-gaudi2.sh --skip-pytorch   # 只装驱动,不装 PyTorch
+#    sudo ./install-gaudi2.sh --skip-pytorch   # 安装驱动/运行库,不安装或修改 PyTorch
 #    sudo ./install-gaudi2.sh --verify-only    # 只做验证,不改动系统
 #    sudo ./install-gaudi2.sh --check-iommu    # 只检查/配置 iommu=pt
 #    sudo ./install-gaudi2.sh --help
@@ -28,13 +29,10 @@
 set -o pipefail
 
 # ---------------------------- 配置区 ------------------------------------------
-GAUDI_VER="1.24.1"
-GAUDI_REV="482"
-PT_VER="2.11.0"
-PT_BUILD="009b5f6"
-TORCH_FORK="torch-${PT_VER}a0+git${PT_BUILD}-cp312-cp312-linux_x86_64.whl"
-PT_TGZ_URL="https://vault.habana.ai/artifactory/gaudi-pt-modules/${GAUDI_VER}/${GAUDI_REV}/pytorch/ubuntu2404/pytorch_modules-v${PT_VER}_${GAUDI_VER}_${GAUDI_REV}.tgz"
-PKGS="habanalabs-dkms habanalabs-firmware habanalabs-firmware-odm habanalabs-firmware-tools habanalabs-graph habanalabs-qual habanalabs-thunk"
+GAUDI_VER="1.24.2"
+GAUDI_REV="481"
+PT_VER="2.13.0"
+PKGS="habanalabs-dkms habanalabs-firmware habanalabs-firmware-odm habanalabs-firmware-tools habanalabs-graph habanalabs-qual habanalabs-thunk habanalabs-rdma-core"
 WORKDIR="/opt/gaudi-install"
 LOG="${WORKDIR}/install-$(date +%Y%m%d-%H%M%S).log"
 
@@ -48,7 +46,7 @@ for a in "$@"; do
         --verify-only)  VERIFY_ONLY=1 ;;
         --check-iommu)  CHECK_IOMMU_ONLY=1 ;;
         -h|--help)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,/^set -o pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'
             exit 0 ;;
         *) echo "未知参数: $a  (用 --help 查看用法)"; exit 1 ;;
     esac
@@ -65,6 +63,24 @@ hdr()  { echo; echo -e "${B}─────────────────�
          echo -e "${B}──────────────────────────────────────────────────────────────${N}"; }
 die()  { bad "$*"; echo; echo "  日志: $LOG"; exit 1; }
 
+unload_driver() {
+    local m
+    for m in habanalabs_ib habanalabs_en habanalabs_cn habanalabs habanalabs_compat; do
+        if [ -d "/sys/module/$m" ]; then
+            $SUDO rmmod "$m" || die "无法卸载 $m; 请检查设备是否仍被进程使用"
+        fi
+    done
+}
+
+module_strings() {
+    case "$1" in
+        *.zst) zstd -dc "$1" | strings ;;
+        *.xz)  xz -dc "$1" | strings ;;
+        *.gz)  gzip -dc "$1" | strings ;;
+        *)     strings "$1" ;;
+    esac
+}
+
 SUDO=""
 [ "$(id -u)" != "0" ] && SUDO="sudo"
 
@@ -77,12 +93,13 @@ fi
 
 cat <<'BANNER'
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   Intel Gaudi2 (HL-225) 一键部署 —— Gaudi 1.24.1 + PyTorch 2.11             ║
+║   Intel Gaudi2 (HL-225) 一键部署 —— Ubuntu 22.04 / 24.04                  ║
 ║   适用于 OAM 模组 + OAM→PCIe 转接卡,非 Intel 认证平台                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 BANNER
 echo "  开始时间: $(date)"
 echo "  日志文件: $LOG"
+echo "  目标版本: ${GAUDI_VER}-${GAUDI_REV}"
 echo
 
 # ==============================================================================
@@ -95,11 +112,14 @@ if [ -r /etc/os-release ]; then
     . /etc/os-release
     info "系统: $PRETTY_NAME  (内核 $(uname -r))"
     case "$VERSION_ID" in
-        24.04) ok "Ubuntu 24.04 —— 已验证通过" ;;
-        22.04) warn "Ubuntu 22.04 —— 未实测,理论可用" ;;
-        *)     warn "未在 $VERSION_ID 上验证过,继续但请留意" ;;
+        24.04) DIST=noble; PT_OS=ubuntu2404; EXPECTED_PY=3.12 ;;
+        22.04) DIST=jammy; PT_OS=ubuntu2204; EXPECTED_PY=3.10 ;;
+        *)     die "只支持 Ubuntu 22.04/24.04, 当前系统: $PRETTY_NAME" ;;
     esac
 fi
+[ "${ID:-}" = ubuntu ] && [ -n "${DIST:-}" ] || die "无法识别受支持的 Ubuntu 系统"
+PT_TGZ_URL="https://vault.habana.ai/artifactory/gaudi-pt-modules/${GAUDI_VER}/${GAUDI_REV}/pytorch/${PT_OS}/pytorch_modules-v${PT_VER}_${GAUDI_VER}_${GAUDI_REV}.tgz"
+ok "发行版 $DIST; Gaudi ${GAUDI_VER}-${GAUDI_REV}"
 
 # --- root ---
 if [ "$(id -u)" != "0" ]; then
@@ -107,7 +127,7 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # --- Gaudi 卡是否在 PCIe 上 ---
-DEVS=$(lspci -nn 2>/dev/null | grep -i '1da3:' || true)
+DEVS=$(lspci -Dnn 2>/dev/null | grep -i '1da3:' || true)
 if [ -z "$DEVS" ]; then
     bad "PCIe 上找不到 Gaudi 卡 [1da3:xxxx]"
     cat <<'EOF'
@@ -132,7 +152,7 @@ BDF=$(echo "$DEVS" | head -1 | awk '{print $1}')
 info "主设备地址: $BDF"
 
 # --- PCIe 链路宽度 ---
-LNK=$(lspci -vv -s "$BDF" 2>/dev/null | grep -oP 'LnkSta:.*?(?=,.*LnkSta)' | head -1)
+LNK=$(lspci -vv -s "$BDF" 2>/dev/null | grep -oP 'LnkSta:.*' | head -1)
 LNKW=$(echo "$LNK" | grep -oP 'Width x\K[0-9]+' | head -1)
 if [ -n "$LNKW" ]; then
     if [ "$LNKW" = "0" ]; then
@@ -148,7 +168,8 @@ else
 fi
 
 # --- 现有版本 ---
-CUR_DKMS=$(dpkg -l 2>/dev/null | awk '/^ii +habanalabs-dkms/{print $3}' | head -1)
+CUR_DKMS=$(dpkg-query -W -f='${Version} ${db:Status-Status}\n' habanalabs-dkms 2>/dev/null \
+    | awk '$2 == "installed" {print $1}')
 if [ -n "$CUR_DKMS" ]; then
     info "当前已装 habanalabs-dkms: $CUR_DKMS"
     if [ "$CUR_DKMS" = "${GAUDI_VER}-${GAUDI_REV}" ]; then
@@ -170,14 +191,14 @@ fi
 
 # --- 编译工具 ---
 MISS=""
-for t in gcc make dkms dpkg-deb curl; do
+for t in gcc make dkms dpkg-deb curl gpg strings python3; do
     command -v "$t" >/dev/null 2>&1 || MISS="$MISS $t"
 done
 [ -n "$MISS" ] && die "缺少工具:$MISS  (安装:sudo apt install -y$MISS)"
 ok "编译工具就绪 (gcc / make / dkms / curl)"
 
 # --- Python ---
-PY=python3.12
+PY="python${EXPECTED_PY}"
 command -v $PY >/dev/null 2>&1 || PY=python3
 PYV=$($PY -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)
 info "Python: $PYV ($PY)"
@@ -186,6 +207,9 @@ case "$PYV" in
     3.10|3.11) ok "Python $PYV —— 官方也提供对应轮子" ;;
     *) warn "Python $PYV —— 官方轮子是 cp312/cp310/cp311,可能不匹配" ;;
 esac
+if [ "$SKIP_PYTORCH" = 0 ] && [ "$VERIFY_ONLY" = 0 ] && [ "$PYV" != "$EXPECTED_PY" ]; then
+    die "$DIST 的 PyTorch 包需要 Python $EXPECTED_PY; 当前为 $PYV"
+fi
 
 # ==============================================================================
 # 阶段 1:IOMMU 配置(★ 核心修复)
@@ -207,9 +231,7 @@ if [ "$HAS_PT" = "1" ]; then
             ok "IOMMU 域类型 = identity  ★ 核心修复已生效"
         else
             warn "IOMMU 域类型 = $DOM(期望 identity)"
-            info "尝试运行时改为 identity..."
-            $SUDO bash -c "echo identity > /sys/kernel/iommu_groups/$IOMMU_GROUP/type" 2>/dev/null \
-                && ok "已改为 identity" || warn "改不了(驱动可能已绑定),重启后由 iommu=pt 生效"
+            die "IOMMU 域必须为 identity; 请先检查启动配置并重启"
         fi
     fi
 else
@@ -278,37 +300,71 @@ hdr "阶段 2/10 · 安装 Gaudi ${GAUDI_VER} 软件栈"
 if [ "$VERIFY_ONLY" = 1 ]; then
     info "--verify-only:跳过安装"
 else
-    # --- apt 源 ---
+    # --- 备份配置及已打补丁的源码,供失败时恢复 ---
+    BACKUP="$WORKDIR/backup-$(date +%Y%m%d-%H%M%S)"
+    $SUDO mkdir -p "$BACKUP" || die "创建备份目录失败"
+    for d in /usr/src/habanalabs-*; do
+        [ ! -d "$d" ] || $SUDO cp -a "$d" "$BACKUP/" || die "备份源码失败"
+    done
+    for f in /etc/apt/sources.list.d/habanalabs_synapseai.list \
+             /etc/apt/keyrings/habanalabs.gpg /etc/modprobe.d/habanalabs-options.conf \
+             /etc/modules-load.d/habanalabs.conf /etc/profile.d/habanalabs.sh; do
+        [ ! -f "$f" ] || $SUDO cp --parents "$f" "$BACKUP/" || die "备份 $f 失败"
+    done
+    dpkg-query -W 'habanalabs*' 2>/dev/null | $SUDO tee "$BACKUP/packages.txt" >/dev/null
+    apt-mark showhold | $SUDO tee "$BACKUP/holds.txt" >/dev/null
+    ok "备份: $BACKUP"
+
+    # --- 按当前系统选择源,修正已有的跨发行版源 ---
     LIST=/etc/apt/sources.list.d/habanalabs_synapseai.list
-    if [ ! -f "$LIST" ]; then
-        info "添加 Habana apt 源..."
-        echo "deb https://vault.habana.ai/artifactory/debian noble main" | $SUDO tee "$LIST" >/dev/null
-    fi
+    KEYTMP=$(mktemp -d) || die "无法创建密钥临时目录"
+    curl -fSL --retry 3 --connect-timeout 15 --max-time 120 \
+        https://vault.habana.ai/artifactory/api/gpg/key/public -o "$KEYTMP/key.asc" \
+        || die "下载官方仓库签名密钥失败"
+    gpg --batch --yes --dearmor -o "$KEYTMP/key.gpg" "$KEYTMP/key.asc" \
+        || die "无效的仓库签名密钥"
+    $SUDO install -d -m 755 /etc/apt/keyrings
+    $SUDO install -m 644 "$KEYTMP/key.gpg" /etc/apt/keyrings/habanalabs.gpg \
+        || die "安装仓库密钥失败"
+    rm -rf "$KEYTMP"
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/habanalabs.gpg] https://vault.habana.ai/artifactory/debian $DIST main" \
+        | $SUDO tee "$LIST" >/dev/null || die "写入软件源失败"
     ok "apt 源已就绪: $($SUDO cat $LIST | grep -v '^#' | head -1)"
 
     # --- 代理提示 ---
     if [ -n "${http_proxy:-}${https_proxy:-}" ]; then
-        info "检测到代理: ${https_proxy:-$http_proxy}"
+        info "检测到代理环境变量"
     fi
     info "提示: vault.habana.ai 会 302 跳转到 AWS S3。"
     info "      如果下载超时,请把 apt 代理配成【全局】(见文档 §3.1)"
 
-    # --- 卸载旧版本 ---
-    INSTALLED=$(dpkg -l 2>/dev/null | awk '/^ii +habanalabs/{print $2}' | tr '\n' ' ')
-    if [ -n "$INSTALLED" ]; then
-        info "已装:$INSTALLED"
-        info "卸载已有版本..."
-        $SUDO apt-get remove -y --purge $PKGS 2>&1 | tail -3 | sed 's/^/       /'
-    fi
-
-    # --- 安装 ---
+    # 先确认所有目标包可用并完成下载,再卸载旧版本。
     info "apt-get update ..."
-    $SUDO apt-get update -qq 2>&1 | tail -2 | sed 's/^/       /' || warn "apt update 有告警"
+    $SUDO apt-get -o APT::Update::Error-Mode=any update || die "apt update 失败"
 
     SPEC=""
-    for p in $PKGS; do SPEC="$SPEC $p=${GAUDI_VER}-${GAUDI_REV}"; done
+    for p in $PKGS; do
+        apt-cache show "$p=${GAUDI_VER}-${GAUDI_REV}" >/dev/null 2>&1 \
+            || die "$DIST 源缺少 $p=${GAUDI_VER}-${GAUDI_REV}"
+        SPEC="$SPEC $p=${GAUDI_VER}-${GAUDI_REV}"
+    done
+    $SUDO apt-get install --download-only --reinstall -y --allow-downgrades \
+        --allow-change-held-packages $SPEC || die "预下载失败; 尚未卸载旧驱动"
+
+    info "卸载已加载的旧驱动..."
+    unload_driver
+    $SUDO apt-mark unhold $PKGS >/dev/null || die "解除软件包锁定失败"
+    INSTALLED=$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n' $PKGS 2>/dev/null \
+        | awk '$2 == "installed" {print $1}' | tr '\n' ' ')
+    if [ -n "$INSTALLED" ]; then
+        info "卸载已有版本: $INSTALLED"
+        $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get remove -y --purge $INSTALLED \
+            || die "旧软件卸载失败; 备份位于 $BACKUP"
+    fi
+
     info "安装:$SPEC"
-    if ! $SUDO apt-get install -y --allow-downgrades $SPEC 2>&1 | tail -15 | sed 's/^/       /'; then
+    if ! $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+        apt-get install --reinstall -y --allow-downgrades $SPEC; then
         die "安装失败。常见原因:
        1. apt 代理未覆盖 S3 跳转 → 配【全局】代理
        2. vault.habana.ai 不可达
@@ -322,7 +378,7 @@ fi
 
 # --- 定位源码目录 ---
 SRC=""
-for d in /usr/src/habanalabs-*; do
+for d in "/usr/src/habanalabs-${GAUDI_VER}-${GAUDI_REV}"; do
     [ -d "$d/drivers" ] || continue
     case "$d" in *.bak|*ORIG*) continue;; esac
     SRC="$d"
@@ -392,7 +448,7 @@ if "/*PATCHED*/" in t:
 elif t.count(P12_OLD) == 1:
     t = t.replace(P12_OLD, P12_NEW, 1); print("  补丁 ①② ✅ 已应用")
 else:
-    print("  补丁 ①② ❌ 未找到匹配(源码版本不符?)  count=%d" % t.count(P12_OLD))
+    sys.exit("补丁 ①② 未找到匹配,拒绝继续: count=%d" % t.count(P12_OLD))
 # ③
 if "PATCHED: FW link_mask=0" in t:
     print("  补丁 ③  已存在,跳过")
@@ -401,7 +457,7 @@ else:
     if idx >= 0:
         t = t[:idx] + P3_NEW + t[idx+len(P3_OLD):]; print("  补丁 ③  ✅ 已应用")
     else:
-        print("  补丁 ③  ❌ 未找到匹配")
+        sys.exit("补丁 ③ 未找到匹配,拒绝继续")
 
 if t != orig:
     with open(CN, "wb") as f:
@@ -417,7 +473,10 @@ print("    server_type 已修正  : %s" % ("是" if "HL_SERVER_GAUDI2_HLS2" in c
 print("    bad SerDes 不再return: %s" % ("是" if "return -EFAULT" not in c else "否"))
 a,b = c.count("{"), c.count("}")
 print("    { } 配平            : %s (%d/%d)" % ("OK" if a==b else "✗", a, b))
+if a != b or c.count("PATCHED") != 3:
+    sys.exit("补丁校验失败")
 PYEOF
+    [ "$?" = 0 ] || die "源码补丁失败; 没有加载未经验证的新驱动"
     ok "补丁处理完成"
 fi
 
@@ -445,13 +504,12 @@ else
     ok "编译完成"
 
     info "安装模块..."
-    $SUDO dkms install "habanalabs/$DVER" -k "$KVER" 2>&1 | tail -3 | sed 's/^/       /'
+    $SUDO dkms install "habanalabs/$DVER" -k "$KVER" --force \
+        || die "DKMS 安装失败"
 fi
 
 # --- ★ 关键检查:模块不能是 0 字节 ---
-MODDIR="/var/lib/dkms/habanalabs/$DVER/$KVER"
-KO=$(find "$MODDIR" -name 'habanalabs.ko*' 2>/dev/null | head -1)
-[ -z "$KO" ] && KO="/lib/modules/$KVER/updates/dkms/habanalabs.ko.zst"
+KO=$(modinfo -k "$KVER" -n habanalabs 2>/dev/null)
 if [ -f "$KO" ]; then
     SZ=$(stat -c%s "$KO")
     if [ "$SZ" -lt 10000 ]; then
@@ -463,13 +521,12 @@ if [ -f "$KO" ]; then
     fi
     ok "模块大小正常:$((SZ/1024)) KB"
     # --- 补丁是否编入 ---
-    if command -v zstd >/dev/null 2>&1; then
-        PATCHED=$(zstd -dc "$KO" 2>/dev/null | strings | grep -c 'PATCHED')
-        [ "$PATCHED" -ge 2 ] && ok "补丁已编入模块(PATCHED 标记 $PATCHED 处)" \
-            || bad "模块里找不到 PATCHED 标记 —— 补丁可能没生效!"
-    fi
+    MARKERS=$(module_strings "$KO") || die "无法读取模块 $KO"
+    PATCHED=$(printf '%s\n' "$MARKERS" | grep -c 'PATCHED')
+    [ "$PATCHED" -ge 2 ] && ok "补丁已编入模块(PATCHED 标记 $PATCHED 处)" \
+        || die "模块里找不到两处 PATCHED 标记"
 else
-    bad "找不到编译出的模块"
+    die "找不到编译出的模块"
 fi
 
 # ==============================================================================
@@ -495,12 +552,16 @@ if [ "$VERIFY_ONLY" = 0 ]; then
     printf '# Habana Gaudi 驱动加载顺序(aux 先,主模块后)\nhabanalabs_compat\nhabanalabs_cn\nhabanalabs_en\nhabanalabs_ib\nhabanalabs\n' \
         | $SUDO tee "$ML" >/dev/null
     ok "已配置开机自动加载: $ML"
+    # 包安装期间生成的 initramfs 可能包含尚未打补丁的模块。
+    $SUDO update-initramfs -u -k "$KVER" || die "更新 initramfs 失败"
+    ok "已同步补丁模块及参数到 initramfs"
 fi
 
 # --- 加载驱动 ---
 hdr "阶段 6/10 · 加载驱动"
 
 # 安全网(运行时)
+if [ "$VERIFY_ONLY" = 0 ]; then
 $SUDO bash -c '
   echo 1  > /proc/sys/kernel/nmi_watchdog
   echo 1  > /proc/sys/kernel/hardlockup_panic 2>/dev/null || true
@@ -511,23 +572,17 @@ $SUDO bash -c '
   echo 20 > /proc/sys/kernel/panic
 ' 2>/dev/null
 ok "安全网已就绪(panic 后 20 秒自动重启)"
-
-if [ "$VERIFY_ONLY" = 0 ]; then
-    $SUDO bash -c "
-      for m in habanalabs_ib habanalabs_en habanalabs_cn habanalabs habanalabs_compat; do
-          rmmod \$m 2>/dev/null
-      done
-      modprobe habanalabs_compat 2>/dev/null
-      modprobe habanalabs_cn  2>/dev/null
-      modprobe habanalabs_en  2>/dev/null
-      modprobe habanalabs_ib  2>/dev/null
-      echo '  加载主驱动(约 50 秒,固件加载)...'
-      modprobe habanalabs
-      echo \"  退出码=\$?\"
-    " 2>&1 | sed 's/^/  /'
 fi
 
-if lsmod | grep -q '^habanalabs '; then
+if [ "$VERIFY_ONLY" = 0 ]; then
+    unload_driver
+    for m in habanalabs_compat habanalabs_cn habanalabs_en habanalabs_ib habanalabs; do
+        info "加载 $m ..."
+        $SUDO modprobe "$m" || die "加载 $m 失败; 请检查 dmesg"
+    done
+fi
+
+if [ -d /sys/module/habanalabs ]; then
     ok "主驱动已加载"
 else
     bad "主驱动未加载!"
@@ -543,24 +598,26 @@ AUX=$(ls /sys/bus/auxiliary/devices/ 2>/dev/null | grep -c habana)
 
 if command -v hl-smi >/dev/null 2>&1; then
     echo
-    hl-smi 2>&1 | sed -n '1,9p' | sed 's/^/  /'
+    hl-smi || die "hl-smi 失败; 请检查用户态软件包及设备状态"
+else
+    die "缺少 hl-smi"
 fi
 
 # ==============================================================================
-# 阶段 7:安装 PyTorch 2.11 + habana 插件
+# 阶段 7:可选 PyTorch 环境 (与系统及用户现有 Python 环境隔离)
 # ==============================================================================
 hdr "阶段 7/10 · 安装 PyTorch ${PT_VER} + habana ${GAUDI_VER}.${GAUDI_REV}"
 
 if [ "$VERIFY_ONLY" = 1 ] || [ "$SKIP_PYTORCH" = 1 ]; then
     info "跳过 PyTorch 安装"
 else
-    PYD=$WORKDIR/pt
+    PYD="$WORKDIR/pt-${GAUDI_VER}-${GAUDI_REV}-${PT_OS}"
     $SUDO mkdir -p "$PYD"
 
     # --- 下载 ---
     TGZ="$PYD/pt.tgz"
     if [ ! -s "$TGZ" ]; then
-        info "下载 PyTorch 模块包 (238MB)..."
+        info "下载 PyTorch 模块包..."
         info "  $PT_TGZ_URL"
         if ! $SUDO curl -fSL --retry 3 -o "$TGZ" "$PT_TGZ_URL"; then
             bad "下载失败。若需代理: export https_proxy=http://<proxy>:<port>"
@@ -574,57 +631,25 @@ else
     [ -f "$PYD/install.sh" ] || die "解压失败"
     ok "已解压"
 
-    PIP="$PY -m pip"
-
-    # --- 清理旧版本(两个位置都要) ---
-    info "清理旧 torch / habana ..."
-    $SUDO $PIP uninstall -y torch torchvision torchaudio \
-        habana_torch_plugin habana-torch-plugin habana_gpu_migration \
-        habana-torch-dataloader habana-pyhlml 2>&1 | grep -E 'Successfully|not installed' | tail -5 | sed 's/^/       /' || true
-    $SUDO rm -rf /usr/local/lib/python3.*/dist-packages/torch* \
-                /usr/local/lib/python3.*/dist-packages/habana* 2>/dev/null || true
-    for h in /home/*/.local/lib/python3.*/site-packages; do
-        [ -d "$h" ] && $SUDO rm -rf "$h"/torch* "$h"/habana* 2>/dev/null
+    VENV="$WORKDIR/venv-${GAUDI_VER}-${GAUDI_REV}-${PT_OS}"
+    $SUDO "$PY" -m venv "$VENV" || die "创建虚拟环境失败; 请安装 python${EXPECTED_PY}-venv"
+    PY="$VENV/bin/python"
+    PYTAG="cp${PYV//./}"
+    WHEELS=()
+    for w in "$PYD"/*.whl; do
+        case "$w" in
+            *-"$PYTAG"-"$PYTAG"-*.whl|*-py3-none-any.whl|*-py2.py3-none-any.whl) WHEELS+=("$w") ;;
+        esac
     done
-    ok "已清理"
-
-    # --- 1. habana-pyhlml ---
-    info "[1/4] habana-pyhlml==${GAUDI_VER}.${GAUDI_REV} (来自 PyPI)"
-    $SUDO $PIP install --disable-pip-version-check \
-        "habana-pyhlml==${GAUDI_VER}.${GAUDI_REV}" 2>&1 | tail -3 | sed 's/^/       /'
-
-    # --- 2. torchvision(它会拉上游 torch,没关系,下一步覆盖) ---
-    info "[2/4] torchvision(会拉上游 torch,稍后被 Habana fork 覆盖)"
-    $SUDO $PIP install --disable-pip-version-check --no-cache-dir \
-        "torchvision==0.26.0" --index-url https://download.pytorch.org/whl/cpu \
-        2>&1 | tail -3 | sed 's/^/       /' || warn "torchvision 安装失败(非致命)"
-
-    # --- 3. ★ 本地 wheels,必须最后装 ---
-    info "[3/4] ★ 本地 wheels(含 Habana torch)—— 必须最后装,覆盖上游 torch"
-    $SUDO $PIP install --disable-pip-version-check --no-deps --force-reinstall \
-        "$PYD/$TORCH_FORK" 2>&1 | tail -3 | sed 's/^/       /'
-    $SUDO $PIP install --disable-pip-version-check --no-deps --force-reinstall \
-        "$PYD"/habana_torch_plugin-*.whl "$PYD"/habana_gpu_migration-*.whl \
-        "$PYD"/habana_torch_dataloader-*.whl "$PYD"/torch_tb_profiler-*.whl \
-        "$PYD"/neural_compressor_pt-*.whl "$PYD"/intel_transformer_engine-*.whl \
-        2>&1 | tail -4 | sed 's/^/       /'
-
-    # --- 4. requirements ---
-    info "[4/4] requirements-pytorch.txt"
-    $SUDO $PIP install --disable-pip-version-check -r "$PYD/requirements-pytorch.txt" \
-        2>&1 | tail -3 | sed 's/^/       /'
-
-    # --- 加固:再装一次本地 torch ---
-    $SUDO $PIP install --disable-pip-version-check --no-deps --force-reinstall \
-        "$PYD/$TORCH_FORK" 2>&1 | tail -2 | sed 's/^/       /'
-
-    # --- ★ 断言校验 ---
-    VER=$($PY -c 'import torch;print(torch.__version__)' 2>/dev/null)
-    if echo "$VER" | grep -q '+cpu'; then
-        die "torch 被装成了上游 CPU 版($VER)—— 没有 HPU 支持!
-       修复: sudo $PIP install --no-deps --force-reinstall $PYD/$TORCH_FORK"
-    fi
-    ok "torch = $VER  (Habana fork)"
+    TORCH_WHEELS=("$PYD"/torch-*-"$PYTAG"-"$PYTAG"-*.whl)
+    [ "${#TORCH_WHEELS[@]}" = 1 ] && [ -f "${TORCH_WHEELS[0]}" ] \
+        || die "模块包中没有唯一匹配 $PYTAG 的 torch 轮子"
+    $SUDO "$PY" -m pip install --disable-pip-version-check "${WHEELS[@]}" \
+        -r "$PYD/requirements-pytorch.txt" "habana-pyhlml==${GAUDI_VER}.${GAUDI_REV}" \
+        || die "Gaudi 虚拟环境安装失败"
+    $SUDO "$PY" -c 'import torch, habana_frameworks.torch; print(torch.__version__)' \
+        || die "Gaudi PyTorch 导入失败"
+    ok "PyTorch 环境: $VENV"
 fi
 
 # ==============================================================================
@@ -642,6 +667,7 @@ grep -qs GC_KERNEL_PATH /etc/profile.d/habanalabs.sh 2>/dev/null \
     && ok "GC_KERNEL_PATH 已配置(图编译必需)" \
     || warn "GC_KERNEL_PATH 未配置 → 图编译会失败(status 26)"
 
+if [ "$VERIFY_ONLY" = 0 ]; then
 $SUDO mkdir -p /var/log/habana_logs && $SUDO chmod 777 /var/log/habana_logs
 ok "日志目录 /var/log/habana_logs 就绪"
 
@@ -658,6 +684,7 @@ exec bash -lc '
 EOS
 $SUDO chmod +x /usr/local/bin/hpu-run
 ok "已安装便捷命令 /usr/local/bin/hpu-run"
+fi
 
 # ==============================================================================
 # 阶段 9:持久化与防护
@@ -681,11 +708,12 @@ EOS
 fi
 
 # --- 健康检查工具 ---
+if [ "$VERIFY_ONLY" = 0 ]; then
 $SUDO tee /usr/local/bin/gaudi-check >/dev/null <<'EOS'
 #!/bin/bash
 # Gaudi2 健康检查 —— 关键项一眼看全
 echo "=============================================="
-echo "  Gaudi2 HL-225 (Gaudi 1.24.1) 健康检查"
+echo "  Gaudi2 HL-225 健康检查 (驱动 $(modinfo -F version habanalabs))"
 echo "=============================================="
 echo
 echo "--- 1. 内核启动参数 ---"
@@ -730,13 +758,43 @@ echo "=============================================="
 EOS
 $SUDO chmod +x /usr/local/bin/gaudi-check
 ok "已安装健康检查 /usr/local/bin/gaudi-check"
+fi
 
 # ==============================================================================
 # 阶段 10:端到端验证
 # ==============================================================================
 hdr "阶段 10/10 · 端到端验证"
 
-TESTF="$WORKDIR/hputest.py"
+# 不依赖 Python 的驱动与运行库检查, --skip-pytorch 也必须执行。
+STATE=$(cat /sys/class/accel/accel0/device/status 2>/dev/null)
+[ "$(cat /sys/class/accel/accel0/device/parent_device 2>/dev/null)" = "$BDF" ] \
+    || die "accel0 与目标 PCI 设备不一致"
+[ "$STATE" = Operational ] || die "Gaudi 设备状态异常: $STATE"
+ok "设备状态: $STATE"
+LIVE_SRC=$(cat /sys/module/habanalabs/srcversion 2>/dev/null)
+[ -n "$LIVE_SRC" ] && [ "$LIVE_SRC" = "$(modinfo -F srcversion habanalabs)" ] \
+    || die "运行中的驱动与磁盘模块不一致"
+[ -n "$RDMA" ] && [ "$AUX" -ge 3 ] || die "RDMA/aux 设备不完整"
+for p in $PKGS; do
+    PV=$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)
+    [ "$PV" = "${GAUDI_VER}-${GAUDI_REV}" ] || die "$p 版本不一致: $PV"
+done
+ok "所有 Gaudi 软件包版本一致: ${GAUDI_VER}-${GAUDI_REV}"
+for lib in /usr/lib/habanalabs/libSynapse.so /usr/lib/habanalabs/libhlml.so; do
+    [ -f "$lib" ] || die "缺少运行库 $lib"
+    LINK_REPORT=$(ldd "$lib" 2>&1) || die "$lib 链接检查失败: $LINK_REPORT"
+    if printf '%s\n' "$LINK_REPORT" | grep -q 'not found'; then
+        die "$lib 存在缺失依赖: $LINK_REPORT"
+    fi
+done
+ok "Synapse/HLML 运行库链接正常"
+
+if [ "$SKIP_PYTORCH" = 1 ]; then
+    info "--skip-pytorch: 未安装或修改 PyTorch,跳过 HPU 计算测试"
+    ok "驱动/固件/运行库验证通过; HPU 计算尚未验证"
+    RC=0
+else
+TESTF=$(mktemp /tmp/gaudi-hputest.XXXXXX.py) || die "创建测试文件失败"
 cat > "$TESTF" <<'EOS'
 import torch, time, sys
 import habana_frameworks.torch.hpu as hthpu
@@ -749,7 +807,7 @@ print("  设备名     :", hthpu.get_device_name(0))
 d = "hpu"
 t0 = time.time()
 a = torch.randn(4096, 4096).to(d); b = torch.randn(4096, 4096).to(d)
-print("  matmul     : sum=%.2f  (%.1fs)" % (a @ b).sum().item(), flush=True)
+print("  matmul     : sum=%.2f  (%.1fs)" % ((a @ b).sum().item(), time.time()-t0), flush=True)
 x = torch.randn(2048, 2048).to(d)
 print("  relu       : sum=%.2f" % torch.relu(x).sum().item())
 m = torch.nn.Sequential(torch.nn.Linear(1024,2048), torch.nn.ReLU(),
@@ -789,8 +847,10 @@ if [ -r /etc/profile.d/habanalabs.sh ] && command -v $PY >/dev/null 2>&1; then
         RC=1
     fi
 else
-    warn "跳过验证(缺少 profile.d 或 Python)"
-    RC=0
+    bad "无法验证(缺少 profile.d 或 Python)"
+    RC=1
+fi
+rm -f "$TESTF"
 fi
 
 # ==============================================================================
