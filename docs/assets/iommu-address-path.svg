@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Diagnosed IOMMU address mismatch</title>
+  <desc id="desc">Repository investigation: in the translated DMA-FQ domain, an IOVA is treated as a physical address by the host-resident PMMU page-table path, leading to corruption on the tested host. The tested workaround uses iommu=pt and verifies an identity domain.</desc>
+  <rect width="1200" height="560" rx="12" fill="#101820"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="56" y="54" font-size="38" fill="#f0f6fc" font-weight="650" text-anchor="start">One address assumption. Two outcomes.</text>
+    <text x="56" y="94" font-size="23" fill="#a5b4c5" font-weight="400" text-anchor="start">Gaudi 1.24.1 · host-resident PMMU tables · tested-platform diagnosis</text>
+    <line x1="56" y1="152" x2="1144" y2="152" stroke="#344352" stroke-width="1"/>
+    <text x="56" y="186" font-size="20" fill="#f0b86e" font-weight="600" text-anchor="start">TRANSLATED DOMAIN / DMA-FQ</text>
+    <text x="56" y="240" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">DMA address / IOVA</text>
+    <text x="448" y="240" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">Treated as physical</text>
+    <text x="840" y="240" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">Page-table corruption</text>
+    <line x1="374" y1="231" x2="408" y2="231" stroke="#f0b86e" stroke-width="2"/>
+    <path d="M400 224 L408 231 L400 238" fill="none" stroke="#f0b86e" stroke-width="2"/>
+    <line x1="766" y1="231" x2="800" y2="231" stroke="#f0b86e" stroke-width="2"/>
+    <path d="M792 224 L800 231 L792 238" fill="none" stroke="#f0b86e" stroke-width="2"/>
+    <text x="56" y="279" font-size="22" fill="#a5b4c5" font-weight="400" text-anchor="start">Recorded failure during HPU acquisition</text>
+    <line x1="56" y1="324" x2="1144" y2="324" stroke="#344352" stroke-width="1"/>
+    <text x="56" y="358" font-size="20" fill="#64b5f6" font-weight="600" text-anchor="start">TESTED WORKAROUND / IDENTITY</text>
+    <text x="56" y="412" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">iommu=pt</text>
+    <text x="448" y="412" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">DMA = physical</text>
+    <text x="840" y="412" font-size="27" fill="#f0f6fc" font-weight="600" text-anchor="start">Compute checks pass</text>
+    <line x1="374" y1="403" x2="408" y2="403" stroke="#64b5f6" stroke-width="2"/>
+    <path d="M400 396 L408 403 L400 410" fill="none" stroke="#64b5f6" stroke-width="2"/>
+    <line x1="766" y1="403" x2="800" y2="403" stroke="#64b5f6" stroke-width="2"/>
+    <path d="M792 396 L800 403 L792 410" fill="none" stroke="#64b5f6" stroke-width="2"/>
+    <text x="56" y="451" font-size="22" fill="#a5b4c5" font-weight="400" text-anchor="start">Verify the active device group is identity before acquiring the HPU</text>
+    <line x1="56" y1="488" x2="1144" y2="488" stroke="#344352" stroke-width="1"/>
+    <text x="56" y="528" font-size="20" fill="#a5b4c5" font-weight="400" text-anchor="start">Source: repository investigation and final solution · not a universal platform claim</text>
+  </g>
+</svg>
