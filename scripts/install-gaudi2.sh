@@ -179,6 +179,21 @@ else
     info "当前未安装 habanalabs-dkms"
 fi
 
+# 只有所有目标包都已安装为目标版本时才跳过卸载/重装；不完整或混合版本继续修复。
+GAUDI_PKGS_MATCH=1
+for p in $PKGS; do
+    PKG_STATE=$(dpkg-query -W -f='${Version}|${db:Status-Status}' "$p" 2>/dev/null || true)
+    if [ "$PKG_STATE" != "${GAUDI_VER}-${GAUDI_REV}|installed" ]; then
+        GAUDI_PKGS_MATCH=0
+        break
+    fi
+done
+if [ "$GAUDI_PKGS_MATCH" = 1 ]; then
+    ok "全部 Gaudi 软件包已是目标版本 ${GAUDI_VER}-${GAUDI_REV}"
+else
+    info "Gaudi 软件包版本不齐，将按目标版本安装/修复"
+fi
+
 # --- 磁盘空间 ---
 AVAIL_MB=$(df -m /usr/src 2>/dev/null | awk 'NR==2{print $4}')
 if [ -n "$AVAIL_MB" ]; then
@@ -299,6 +314,8 @@ hdr "阶段 2/10 · 安装 Gaudi ${GAUDI_VER} 软件栈"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     info "--verify-only:跳过安装"
+elif [ "$GAUDI_PKGS_MATCH" = 1 ]; then
+    ok "所有 Gaudi 软件包已是 ${GAUDI_VER}-${GAUDI_REV}，跳过 apt 卸载和重装"
 else
     # --- 备份配置及已打补丁的源码,供失败时恢复 ---
     BACKUP="$WORKDIR/backup-$(date +%Y%m%d-%H%M%S)"
