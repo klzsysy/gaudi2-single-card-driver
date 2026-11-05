@@ -497,6 +497,13 @@ PYEOF
     ok "补丁处理完成"
 fi
 
+GAUDI_SOURCE_PATCHED=0
+if grep -qF '/*PATCHED*/' "$CN" \
+    && grep -qF 'PATCHED-ignore-bad-serdes' "$CN" \
+    && grep -qF 'PATCHED: FW link_mask=0' "$CN"; then
+    GAUDI_SOURCE_PATCHED=1
+fi
+
 # ==============================================================================
 # 阶段 4:DKMS 编译 + 安装  ⚠️ 必须先 build 再 install
 # ==============================================================================
@@ -504,9 +511,40 @@ hdr "阶段 4/10 · DKMS 编译(★ 必须 build --force,否则产生 0 字节�
 
 KVER=$(uname -r)
 DVER="${GAUDI_VER}-${GAUDI_REV}"
+GAUDI_REUSE_DRIVER=0
+
+# 只有活动模块、磁盘模块和源码都含目标补丁且设备健康时，才复用当前驱动。
+if [ "$VERIFY_ONLY" = 0 ] && [ "$GAUDI_PKGS_MATCH" = 1 ] \
+    && [ "$GAUDI_SOURCE_PATCHED" = 1 ]; then
+    CURRENT_KO=$(modinfo -k "$KVER" -n habanalabs 2>/dev/null || true)
+    CURRENT_KO_SRC=$(modinfo -k "$KVER" -F srcversion habanalabs 2>/dev/null || true)
+    ACTIVE_SRC=$(cat /sys/module/habanalabs/srcversion 2>/dev/null || true)
+    ACTIVE_STATE=$(cat /sys/class/accel/accel0/device/status 2>/dev/null || true)
+    ACTIVE_PARAM=$(cat /sys/module/habanalabs/parameters/nic_ports_ext_mask 2>/dev/null || true)
+    CURRENT_RDMA=$(ls /sys/class/infiniband/ 2>/dev/null | head -1)
+    CURRENT_AUX=$(ls /sys/bus/auxiliary/devices/ 2>/dev/null | grep -c habana || true)
+    CURRENT_MARKERS=0
+    if [ -f "$CURRENT_KO" ]; then
+        CURRENT_MARKERS=$(module_strings "$CURRENT_KO" 2>/dev/null | grep -c 'PATCHED' || true)
+    fi
+
+    if [ -d /sys/module/habanalabs ] \
+        && [ -n "$CURRENT_KO_SRC" ] \
+        && [ "$ACTIVE_SRC" = "$CURRENT_KO_SRC" ] \
+        && [ "$ACTIVE_STATE" = Operational ] \
+        && [ "$ACTIVE_PARAM" = 0 ] \
+        && [ -n "$CURRENT_RDMA" ] \
+        && [ "$CURRENT_AUX" -ge 3 ] \
+        && [ "$CURRENT_MARKERS" -ge 2 ]; then
+        GAUDI_REUSE_DRIVER=1
+        ok "当前目标版本驱动、补丁、模块参数和设备状态均正常，将复用已加载模块"
+    fi
+fi
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     info "--verify-only:跳过编译"
+elif [ "$GAUDI_REUSE_DRIVER" = 1 ]; then
+    ok "跳过 DKMS 重建，复用当前已加载的目标版本驱动"
 else
     info "卸载旧 DKMS 树..."
     $SUDO dkms remove "habanalabs/$DVER" -k "$KVER" --force >/dev/null 2>&1 || true
@@ -592,11 +630,15 @@ ok "安全网已就绪(panic 后 20 秒自动重启)"
 fi
 
 if [ "$VERIFY_ONLY" = 0 ]; then
-    unload_driver
-    for m in habanalabs_compat habanalabs_cn habanalabs_en habanalabs_ib habanalabs; do
-        info "加载 $m ..."
-        $SUDO modprobe "$m" || die "加载 $m 失败; 请检查 dmesg"
-    done
+    if [ "$GAUDI_REUSE_DRIVER" = 1 ]; then
+        ok "跳过驱动卸载和重载，保持当前健康模块运行"
+    else
+        unload_driver
+        for m in habanalabs_compat habanalabs_cn habanalabs_en habanalabs_ib habanalabs; do
+            info "加载 $m ..."
+            $SUDO modprobe "$m" || die "加载 $m 失败; 请检查 dmesg"
+        done
+    fi
 fi
 
 if [ -d /sys/module/habanalabs ]; then
