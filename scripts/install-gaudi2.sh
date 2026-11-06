@@ -72,14 +72,9 @@ unload_driver() {
     done
 }
 
-module_strings() {
-    case "$1" in
-        *.zst) zstd -dc "$1" | strings ;;
-        *.xz)  xz -dc "$1" | strings ;;
-        *.gz)  gzip -dc "$1" | strings ;;
-        *)     strings "$1" ;;
-    esac
-}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 1
+# shellcheck source=scripts/lib/gaudi-dkms.sh
+. "$SCRIPT_DIR/lib/gaudi-dkms.sh" || die "无法读取 DKMS 辅助脚本"
 
 SUDO=""
 [ "$(id -u)" != "0" ] && SUDO="sudo"
@@ -307,6 +302,17 @@ if [ "$CHECK_IOMMU_ONLY" = 1 ]; then
     echo; ok "IOMMU 检查完成"; exit 0
 fi
 
+# 检查所有可启动内核；厂商 postinst 默认只为 uname -r 构建驱动。
+KVER=$(uname -r)
+DVER="${GAUDI_VER}-${GAUDI_REV}"
+KERNEL_LIST=$(gaudi_kernel_targets "$KVER" /boot) || die "无法枚举目标内核"
+mapfile -t GAUDI_KERNELS <<< "$KERNEL_LIST"
+info "目标内核: ${GAUDI_KERNELS[*]}"
+if [ "$VERIFY_ONLY" = 0 ]; then
+    gaudi_check_kernel_headers /lib/modules "${GAUDI_KERNELS[@]}" \
+        || die "请补齐所有目标内核的 headers 后重试；尚未卸载或重装驱动"
+fi
+
 # ==============================================================================
 # 阶段 2:安装 Gaudi 1.24.1 软件栈
 # ==============================================================================
@@ -509,8 +515,6 @@ fi
 # ==============================================================================
 hdr "阶段 4/10 · DKMS 编译(★ 必须 build --force,否则产生 0 字节模块)"
 
-KVER=$(uname -r)
-DVER="${GAUDI_VER}-${GAUDI_REV}"
 GAUDI_REUSE_DRIVER=0
 
 # 只有活动模块、磁盘模块和源码都含目标补丁且设备健康时，才复用当前驱动。
@@ -535,54 +539,16 @@ if [ "$VERIFY_ONLY" = 0 ] && [ "$GAUDI_PKGS_MATCH" = 1 ] \
         && [ "$ACTIVE_PARAM" = 0 ] \
         && [ -n "$CURRENT_RDMA" ] \
         && [ "$CURRENT_AUX" -ge 3 ] \
-        && [ "$CURRENT_MARKERS" -ge 2 ]; then
+        && [ "$CURRENT_MARKERS" -ge 2 ] \
+        && gaudi_kernel_driver_ready "$KVER" "$DVER"; then
         GAUDI_REUSE_DRIVER=1
         ok "当前目标版本驱动、补丁、模块参数和设备状态均正常，将复用已加载模块"
     fi
 fi
 
-if [ "$VERIFY_ONLY" = 1 ]; then
-    info "--verify-only:跳过编译"
-elif [ "$GAUDI_REUSE_DRIVER" = 1 ]; then
-    ok "跳过 DKMS 重建，复用当前已加载的目标版本驱动"
-else
-    info "卸载旧 DKMS 树..."
-    $SUDO dkms remove "habanalabs/$DVER" -k "$KVER" --force >/dev/null 2>&1 || true
-
-    info "编译中(约 30-60 秒)..."
-    if ! $SUDO dkms build "habanalabs/$DVER" -k "$KVER" --force 2>&1 | tail -8 | sed 's/^/       /'; then
-        die "DKMS 编译失败。常见原因:
-       1. 补丁破坏了源码(检查 $CN 的 { } 配平)
-       2. 内核头文件缺失: sudo apt install linux-headers-$KVER
-       3. 旧内核的 MIN/MAX 宏冲突(1.24.1 已修复)"
-    fi
-    ok "编译完成"
-
-    info "安装模块..."
-    $SUDO dkms install "habanalabs/$DVER" -k "$KVER" --force \
-        || die "DKMS 安装失败"
-fi
-
-# --- ★ 关键检查:模块不能是 0 字节 ---
-KO=$(modinfo -k "$KVER" -n habanalabs 2>/dev/null)
-if [ -f "$KO" ]; then
-    SZ=$(stat -c%s "$KO")
-    if [ "$SZ" -lt 10000 ]; then
-        bad "模块只有 $SZ 字节 —— 是空的!"
-        die "说明 dkms install 之前没有真正编译。请手动执行:
-       sudo dkms remove habanalabs/$DVER -k $KVER --force
-       sudo dkms build  habanalabs/$DVER -k $KVER --force   ← 必须
-       sudo dkms install habanalabs/$DVER -k $KVER"
-    fi
-    ok "模块大小正常:$((SZ/1024)) KB"
-    # --- 补丁是否编入 ---
-    MARKERS=$(module_strings "$KO") || die "无法读取模块 $KO"
-    PATCHED=$(printf '%s\n' "$MARKERS" | grep -c 'PATCHED')
-    [ "$PATCHED" -ge 2 ] && ok "补丁已编入模块(PATCHED 标记 $PATCHED 处)" \
-        || die "模块里找不到两处 PATCHED 标记"
-else
-    die "找不到编译出的模块"
-fi
+# 活动驱动健康只决定是否重载，不能跳过其它内核的磁盘驱动检查。
+gaudi_ensure_kernel_drivers "$DVER" "$VERIFY_ONLY" "${GAUDI_KERNELS[@]}" \
+    || die "目标内核驱动尚未全部就绪，请修复上述错误后再重启"
 
 # ==============================================================================
 # 阶段 5:模块参数 + 开机自动加载
@@ -608,8 +574,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
         | $SUDO tee "$ML" >/dev/null
     ok "已配置开机自动加载: $ML"
     # 包安装期间生成的 initramfs 可能包含尚未打补丁的模块。
-    $SUDO update-initramfs -u -k "$KVER" || die "更新 initramfs 失败"
-    ok "已同步补丁模块及参数到 initramfs"
+    gaudi_update_kernel_initramfs "${GAUDI_KERNELS[@]}" || die "更新目标内核 initramfs 失败"
+    ok "已同步所有目标内核的补丁模块及参数到 initramfs"
 fi
 
 # --- 加载驱动 ---
@@ -942,6 +908,8 @@ cat <<EOF
 
   ⚠️  注意事项:
     · iommu=pt 是核心修复,不要从 GRUB 里删掉!
+    · 已检查可启动内核: ${GAUDI_KERNELS[*]}
+    · 更新内核或重装驱动后,重启前运行 --verify-only --skip-pytorch 检查各内核
     · 已 apt-mark hold 相关包,不要 apt upgrade 它们
     · 镜像/备份:见 Gaudi2-1.24.1-完整解决方案.md §7
 

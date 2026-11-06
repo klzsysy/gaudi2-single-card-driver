@@ -5,8 +5,8 @@
 **Bring an Intel Gaudi2 OAM module online through a PCIe adapter on Ubuntu.**
 
 [![Hardware: Gaudi2 HL-225](https://img.shields.io/badge/Gaudi2-HL--225-0071C5?style=flat-square)](#validated-setup)
-[![Gaudi software: 1.24.1](https://img.shields.io/badge/Gaudi_Software-1.24.1-4B5563?style=flat-square)](#validated-setup)
-[![PyTorch: Intel build 2.11](https://img.shields.io/badge/PyTorch-Intel_2.11-EE4C2C?style=flat-square)](#validated-setup)
+[![Gaudi software: 1.24.1 / 1.24.2](https://img.shields.io/badge/Gaudi_Software-1.24.1%20%2F%201.24.2-4B5563?style=flat-square)](#validated-setup)
+[![PyTorch: Intel build 2.11 / 2.13](https://img.shields.io/badge/PyTorch-Intel_2.11%20%2F%202.13-EE4C2C?style=flat-square)](#validated-setup)
 
 [Quick start](#quick-start) · [Five-part fix](#the-five-part-fix) · [Troubleshooting](#troubleshooting) · [Documentation](#documentation) · [Limitations](#limitations)
 
@@ -23,7 +23,11 @@ A practical record of **hardware installation, driver patches, PyTorch setup, an
 
 ## Validated setup
 
-The project's final solution records successful computation and reboot verification on **GIGABYTE MU70-SU0-NV-XX + Xeon E5-2696 v3 + Gaudi2 HL-225**. These are existing project results, not new tests performed for this documentation update.
+Two host configurations have been checked. Their software versions and validation scope are listed separately.
+
+### GIGABYTE MU70-SU0-NV-XX / Xeon E5-2696 v3
+
+The project's original final solution records successful computation and reboot verification on this platform.
 
 | Component / check | Recorded result |
 |:---|:---|
@@ -39,6 +43,35 @@ The project's final solution records successful computation and reboot verificat
 
 The [final solution](./完整解决方案.md) supersedes interim failure conclusions in the historical investigation logs.
 
+### Supermicro H13SSL-N / AMD engineering sample
+
+Hardware and driver state checked on **2026-11-06** using DMI, `lscpu`,
+`lspci`, DKMS and `hl-smi`. The CPU identifies itself as an engineering sample;
+a retail CPU model has not been inferred from its identifier.
+
+| Component / check | Observed result |
+|:---|:---|
+| Motherboard / BIOS | **Supermicro H13SSL-N**, board revision `1.01`; AMI BIOS `3.8`, dated `2026-01-06` |
+| CPU | **AMD Eng Sample: `100-000000897-03`**; one socket, 32 cores / 64 threads |
+| System RAM | **96 GB**, four 24 GB DDR5 registered DIMMs, configured at **4800 MT/s**; about 94 GiB visible to Linux |
+| Accelerator | One **Gaudi2 HL-225**, PCI ID `1da3:1020` rev 01; `hl-smi` reports **98304 MiB** device memory |
+| PCIe link | **Gen4 x16**, negotiated at **16 GT/s x16** |
+| Operating system | **Ubuntu 22.04.5 LTS**, x86_64 |
+| Kernel | Originally validated on `5.15.0-186-generic`; currently running `5.15.0-202-generic` |
+| Gaudi software / loaded driver | **`1.24.2-481`** / `1.24.2-52a555d` |
+| Habana PyTorch / plugin / Python | `2.13.0a0+git2469d18` / `1.24.2.481` / Python `3.10.12` |
+| IOMMU / module option | `iommu=pt`, device domain **`identity`**; `nic_ports_ext_mask=0` |
+| Driver / networking devices | **Operational**, `hl-smi` works; `hbl_0` and all three Habana auxiliary devices present |
+| DKMS / headers | Patched modules and headers verified for **both `186` and `202` kernels** |
+| Compute after driver recovery | HPU available, one `GAUDI2`; BF16 **4×4 matmul** matched the CPU reference exactly on kernel `202` |
+| Earlier application validation | On kernel `186`, a separate ComfyUI HPU adaptation completed Krea2, Qwen-Image-2.1-Turbo and MOSS-Image SFT generation at 512² / 1024²; this does not establish stock ComfyUI compatibility |
+| Reboot scope | Reboot into `202` exposed missing DKMS modules; online recovery and checks passed. **A further reboot after the fix has not been tested.** |
+
+This host confirmed that a healthy driver on the running kernel does not prove
+that another installed kernel is ready to boot. The installer now checks all
+bootable kernel images; see [Kernel updates and reboot readiness](#kernel-updates-and-reboot-readiness).
+
+
 ## Choose your entry point
 
 | Situation | Start here |
@@ -51,18 +84,24 @@ The [final solution](./完整解决方案.md) supersedes interim failure conclus
 
 ## Before installation
 
-This is a **community adaptation for a specific hardware combination**. The installer changes kernel boot arguments, patches DKMS source, installs software, writes module parameters, and holds selected packages. Arrange console access or a recovery path before changing a host.
+This is a **community adaptation for the hardware combinations above**. The installer changes kernel boot arguments, patches DKMS source, installs software, writes module parameters, and holds selected packages. Arrange console access or a recovery path before changing a host.
 
-| Requirement | What to check |
-|:---|:---|
-| Hardware | Gaudi2 OAM module and a compatible OAM-to-PCIe adapter |
-| Slot | A CPU-connected PCIe x16 slot; the tested link negotiated Gen3 x8 |
-| Power | The documented adapter setup uses **48 V / 54 V auxiliary power**, not an ordinary 12 V PCIe power lead |
-| Operating system | Ubuntu; the recorded working setup uses 24.04.4 |
-| Access / tools | `sudo`, `gcc`, `make`, `dkms`, `curl`, `dpkg-deb`, and Python 3.12 for the pinned wheels |
-| IOMMU | `iommu=pt` in the active boot command line; device group type `identity` |
-| Module options | `nic_ports_ext_mask=0`; **do not add `card_type=0`** |
-| Python packages | Install the Habana PyTorch wheels last so upstream CPU wheels do not replace them |
+| Requirement | What to check | H13SSL-N validation (2026-11-06) |
+|:---|:---|:---|
+| Hardware | Gaudi2 OAM module and a compatible OAM-to-PCIe adapter | HL-225 enumerated as `1da3:1020` and reached Operational state |
+| Slot | A CPU-connected PCIe x16 slot; check the actual negotiated link | **Gen4 x16 / 16 GT/s**, compared with Gen3 x8 on the original GIGABYTE host |
+| Power | The documented adapter setup uses **48 V / 54 V auxiliary power**, not an ordinary 12 V PCIe power lead | Supply voltage and adapter wiring were not measured by these software checks |
+| Operating system | Ubuntu **22.04 or 24.04** | **22.04.5 LTS**; original platform uses 24.04.4 |
+| Access / tools | `sudo`, `gcc`, `make`, `dkms`, `curl`, `gpg`, `dpkg-deb`, `strings`, and the matching kernel headers | Installer preflight passed; headers present for `5.15.0-186` and `5.15.0-202` |
+| Bootable kernels | Check every installed `/boot/vmlinuz-*` target, including kernels not yet running | Both kernels have the patched `1.24.2-481` DKMS driver; only checking `uname -r` previously missed `202` |
+| IOMMU | `iommu=pt` in the active boot command line; device group type `identity` | Both verified; HPU computation passed with this configuration |
+| Module options | `nic_ports_ext_mask=0`; **do not add `card_type=0`** | Active `nic_ports_ext_mask` is **0**; RDMA and auxiliary devices are present |
+| Secure Boot | Confirm that the platform accepts the installed kernel modules | **Disabled** on this host; Secure Boot with enrolled signing keys was not tested |
+| Python packages | Use the matching Habana runtime in an isolated venv: Python **3.10 for Ubuntu 22.04**, **3.12 for Ubuntu 24.04**. Prevent pip from replacing Habana PyTorch | Python **3.10.12**, Habana torch **2.13.0a0**, plugin **1.24.2.481**; do not replace this torch to resolve unrelated package pins |
+
+Run `sudo ./scripts/install-gaudi2.sh --verify-only --skip-pytorch` after a kernel
+update or driver reinstall and before rebooting. It validates the installed
+modules for every target kernel; it does not substitute for a real reboot test.
 
 ## Quick start
 
@@ -77,15 +116,41 @@ cd gaudi2-single-card-driver
 sudo ./scripts/install-gaudi2.sh
 ```
 
-The installer checks the environment, verifies/configures `iommu=pt`, installs Gaudi 1.24.1, applies three source patches, rebuilds DKMS, writes module options, installs PyTorch, and runs compute validation. If it adds a boot argument, reboot and rerun the installer to continue.
+The installer checks the environment, verifies/configures `iommu=pt`, installs Gaudi 1.24.2, applies three source patches, rebuilds DKMS, writes module options, installs PyTorch, and runs compute validation. If it adds a boot argument, reboot and rerun the installer to continue.
 
 | Option | Actual scope |
 |:---|:---|
-| `--skip-pytorch` | Skip the PyTorch installation stage |
-| `--verify-only` | Skip driver installation, source patches, and DKMS rebuild; still performs runtime setup, writes helper scripts/log directories, and runs compute checks |
-| `--check-iommu` | Check the boot argument and IOMMU domain; exits before later installation stages; may attempt a runtime domain change |
+| `--skip-pytorch` | Skip PyTorch installation and HPU compute tests; still validate the driver and runtime libraries |
+| `--verify-only` | Validate installed drivers for all bootable kernels and runtime health without installation or configuration changes; runs compute checks unless combined with `--skip-pytorch` |
+| `--check-iommu` | Check the boot argument and IOMMU domain; exit before later installation stages |
 
-**`--verify-only` is not a read-only audit.** For routine inspection after installation, use the installed health-check command below.
+Use `--verify-only --skip-pytorch` for inspection without HPU compute tests.
+
+### Kernel updates and reboot readiness
+
+The installer checks the running kernel and every kernel image present as
+`/boot/vmlinuz-*`. It requires their headers before changing driver packages,
+builds missing or invalid patched Habana modules for each kernel, and refreshes
+each initramfs. Stale `/lib/modules` directories without boot images are ignored.
+A healthy running driver does not skip checks for a newly installed kernel.
+
+After a kernel update or driver reinstall, check reboot readiness with:
+
+```bash
+sudo ./scripts/install-gaudi2.sh --verify-only --skip-pytorch
+```
+
+This checks each target kernel without rebuilding or running HPU compute tests.
+Missing DKMS installations, auxiliary modules, Gaudi2 aliases or patch markers
+cause a nonzero exit. Install the requested headers and rerun the installer if
+this check fails. It does not reboot the host or validate a complete boot cycle.
+
+The DKMS regression tests use temporary files and mock system commands; no root
+access, package installation or hardware is required:
+
+```bash
+bash tests/test-gaudi-dkms.sh
+```
 
 ### Check and use the device
 
@@ -230,7 +295,7 @@ The README is in English. The detailed installation and investigation records be
 
 | Script | Purpose |
 |:---|:---|
-| [`install-gaudi2.sh`](scripts/install-gaudi2.sh) | Main Gaudi 1.24.1 deployment entry point |
+| [`install-gaudi2.sh`](scripts/install-gaudi2.sh) | Main Gaudi 1.24.2 deployment entry point |
 | [`install-gaudi2-1.18.0-legacy.sh`](scripts/install-gaudi2-1.18.0-legacy.sh) | Legacy installation and rollback reference |
 | [`patch-gaudi.py`](scripts/patch-gaudi.py) | Re-runnable source-patch helper |
 | [`patch-hr-pgt.py`](scripts/patch-hr-pgt.py) / [`patch-nic-skip.py`](scripts/patch-nic-skip.py) | Diagnostic isolation patches |
